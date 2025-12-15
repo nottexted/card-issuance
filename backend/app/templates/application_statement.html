@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>{% include "_base.css" %}</style>
+</head>
+<body>
+  <div class="small">БАНК (демо) • Внутренний документ</div>
+  <h1>Заявление на выпуск платежной карты</h1>
+
+  <div class="grid">
+    <div class="row">
+      <div class="cell label">Номер заявки</div>
+      <div class="cell value"><span class="badge">{{ app.application_no }}</span></div>
+    </div>
+    <div class="row">
+      <div class="cell label">Дата подачи</div>
+      <div class="cell value">{{ app.requested_at.strftime("%d.%m.%Y %H:%M") }}</div>
+    </div>
+  </div>
+
+  <div class="hr"></div>
+
+  <h2>Сведения о клиенте</h2>
+  <div class="grid">
+    <div class="row"><div class="cell label">ФИО</div><div class="cell value">{{ client.full_name }}</div></div>
+    <div class="row"><div class="cell label">Телефон / Email</div><div class="cell value">{{ client.phone or "-" }} / {{ client.email or "-" }}</div></div>
+    <div class="row"><div class="cell label">Документ</div><div class="cell value">{{ client.doc_type or "-" }} {{ client.doc_number or "-" }}</div></div>
+    <div class="row"><div class="cell label">Адрес регистрации</div><div class="cell value">{{ client.reg_address or "-" }}</div></div>
+  </div>
+
+  <h2>Параметры продукта</h2>
+  <div class="grid">
+    <div class="row"><div class="cell label">Продукт</div><div class="cell value">{{ product.name }} ({{ product.payment_system }} / {{ product.level }})</div></div>
+    <div class="row"><div class="cell label">Валюта / Срок</div><div class="cell value">{{ product.currency }} / {{ product.term_months }} мес.</div></div>
+    <div class="row"><div class="cell label">Тариф</div><div class="cell value">{{ tariff.name }}</div></div>
+    <div class="row"><div class="cell label">Имя на карте</div><div class="cell value">{{ app.embossing_name or "-" }}</div></div>
+  </div>
+
+  <h2>Выдача и доставка</h2>
+  <div class="grid">
+    <div class="row"><div class="cell label">Канал</div><div class="cell value">{{ channel.name }}</div></div>
+    <div class="row"><div class="cell label">Офис</div><div class="cell value">{{ branch.name }}, {{ branch.address }}</div></div>
+    <div class="row"><div class="cell label">Способ доставки</div><div class="cell value">{{ delivery.name }}</div></div>
+    <div class="row"><div class="cell label">Адрес доставки</div><div class="cell value">{{ app.delivery_address or "-" }}</div></div>
+  </div>
+
+  <div class="hr"></div>
+
+  <div class="small">
+    Подтверждаю достоверность предоставленных данных и даю согласие на обработку персональных данных.
+    Согласие на маркетинг: {{ "Да" if app.consent_marketing else "Нет" }}.
+  </div>
+
+  <div class="sign">
+    <div class="scol">
+      <div>Подпись клиента</div>
+      <div class="line"></div>
+    </div>
+    <div class="scol">
+      <div>Сотрудник банка</div>
+      <div class="line"></div>
+    </div>
+  </div>
+
+  <div class="footer small">Сформировано автоматически сервисом эмиссии карт.</div>
+</body>
+</html>

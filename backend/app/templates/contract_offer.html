@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>{% include "_base.css" %}</style>
+</head>
+<body>
+  <div class="small">БАНК (демо) • Договор-оферта</div>
+  <h1>Договор-оферта на выпуск и обслуживание платежной карты</h1>
+
+  <div class="grid">
+    <div class="row"><div class="cell label">Номер заявки</div><div class="cell value"><span class="badge">{{ app.application_no }}</span></div></div>
+    <div class="row"><div class="cell label">Клиент</div><div class="cell value">{{ client.full_name }}</div></div>
+    <div class="row"><div class="cell label">Продукт</div><div class="cell value">{{ product.name }} ({{ product.payment_system }} / {{ product.level }})</div></div>
+    <div class="row"><div class="cell label">Тариф</div><div class="cell value">{{ tariff.name }}. Выпуск: {{ "%.2f"|format(tariff.issue_fee) }} ₽, обслуживание: {{ "%.2f"|format(tariff.monthly_fee) }} ₽/мес.</div></div>
+  </div>
+
+  <div class="hr"></div>
+
+  <h2>1. Общие положения</h2>
+  <p>Настоящий документ является публичной офертой. Акцептом оферты является подписание заявления на выпуск карты.</p>
+
+  <h2>2. Права и обязанности клиента</h2>
+  <ul>
+    <li>Предоставлять достоверные сведения и документы.</li>
+    <li>Соблюдать правила использования карты и меры безопасности.</li>
+  </ul>
+
+  <h2>3. Права и обязанности банка</h2>
+  <ul>
+    <li>Осуществить выпуск карты и обеспечить выдачу/доставку в соответствии с выбранным способом.</li>
+    <li>Вести учет операций по тарифному плану, уведомлять о значимых событиях.</li>
+  </ul>
+
+  <h2>4. Ответственность сторон</h2>
+  <p>Стороны несут ответственность в соответствии с законодательством и правилами банка.</p>
+
+  <h2>5. Разрешение споров</h2>
+  <p>Споры решаются в досудебном порядке. При недостижении соглашения — в судебном порядке.</p>
+
+  <h2>6. Срок действия</h2>
+  <p>Договор действует до закрытия карты или прекращения обслуживания.</p>
+
+  <h2>7. Реквизиты</h2>
+  <p>Банк: (демо) • Клиент: {{ client.full_name }}</p>
+
+  <div class="sign">
+    <div class="scol"><div>Подпись клиента</div><div class="line"></div></div>
+    <div class="scol"><div>Подпись банка</div><div class="line"></div></div>
+  </div>
+</body>
+</html>
