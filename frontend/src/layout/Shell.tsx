@@ -75,7 +75,7 @@ export default function Shell({ children }: PropsWithChildren) {
           </Tooltip>
 
           <Typography variant="h6" sx={{ fontWeight: 900, letterSpacing: -0.3 }}>
-            Card Issuance Service
+            ИС Эмиссии платежных карт
           </Typography>
 
           <Box sx={{ flex: 1 }} />
@@ -160,10 +160,7 @@ export default function Shell({ children }: PropsWithChildren) {
           {open ? (
             <>
               <Typography variant="caption" sx={{ color: "#6b7280" }}>
-                Demo-проект: FastAPI + Postgres + React (MUI)
-              </Typography>
-              <Typography variant="caption" sx={{ color: "#9ca3af", display: "block", mt: 0.5 }}>
-                Меню запоминает состояние (localStorage).
+                КТБД ПР4 (Глазунов Е.А.)
               </Typography>
             </>
           ) : (
