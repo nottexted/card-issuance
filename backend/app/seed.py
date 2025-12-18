@@ -1,478 +1,619 @@
 from __future__ import annotations
 
 import random
+import re
+import string
 import uuid
 from datetime import date, datetime, timedelta
+from typing import Iterable
 
-from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .db import SessionLocal
 from . import models
-from .utils import utcnow, next_seq, make_no
 
-
-MIN_CLIENTS = 15
-MIN_BRANCHES = 8
-MIN_APPLICATIONS = 60
-MIN_BATCHES = 4
-
+_RU2EN = {
+    "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y","к":"k","л":"l","м":"m",
+    "н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"ts","ч":"ch","ш":"sh","щ":"sch",
+    "ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
+}
 
 def _exists(db: Session, model) -> bool:
-    return db.execute(select(text("1")).select_from(model.__table__).limit(1)).first() is not None
+    return db.query(model).first() is not None
 
 
 def _count(db: Session, model) -> int:
-    return int(db.execute(select(text("count(1)")).select_from(model.__table__)).scalar_one())
+    return int(db.query(model).count())
 
 
-def _status_id(db: Session, entity: str, code: str) -> int:
-    return db.execute(
-        select(models.RefStatus.id).where(models.RefStatus.entity_type == entity, models.RefStatus.code == code)
-    ).scalar_one()
+def _get_status_id(db: Session, entity_type: str, code: str) -> int:
+    s = (
+        db.query(models.RefStatus)
+        .filter(models.RefStatus.entity_type == entity_type, models.RefStatus.code == code)
+        .one()
+    )
+    return int(s.id)
 
 
-def _ensure_reference_data(db: Session):
-    # Statuses
-    if not _exists(db, models.RefStatus):
-        statuses = []
-        # application
-        statuses += [
-            models.RefStatus(entity_type="application", code="NEW", name="Новая", sort_order=10),
-            models.RefStatus(entity_type="application", code="IN_REVIEW", name="На проверке", sort_order=20),
-            models.RefStatus(entity_type="application", code="APPROVED", name="Одобрена", sort_order=30),
-            models.RefStatus(entity_type="application", code="REJECTED", name="Отказ", sort_order=40),
-            models.RefStatus(entity_type="application", code="IN_BATCH", name="В производстве (партия)", sort_order=50),
-        ]
-        # batch
-        statuses += [
-            models.RefStatus(entity_type="batch", code="CREATED", name="Создана", sort_order=10),
-            models.RefStatus(entity_type="batch", code="SENT", name="Отправлена", sort_order=20),
-            models.RefStatus(entity_type="batch", code="RECEIVED", name="Получена", sort_order=30),
-        ]
-        # card
-        statuses += [
-            models.RefStatus(entity_type="card", code="CREATED", name="Карта создана", sort_order=10),
-            models.RefStatus(entity_type="card", code="ISSUED", name="Выпущена", sort_order=20),
-            models.RefStatus(entity_type="card", code="DELIVERED", name="Доставлена в офис", sort_order=30),
-            models.RefStatus(entity_type="card", code="HANDED", name="Выдана клиенту", sort_order=40),
-            models.RefStatus(entity_type="card", code="ACTIVATED", name="Активирована", sort_order=50),
-            models.RefStatus(entity_type="card", code="CLOSED", name="Закрыта", sort_order=60),
-        ]
-        db.add_all(statuses)
-        db.commit()
-
-    # Channels
-    if not _exists(db, models.RefChannel):
-        db.add_all(
-            [
-                models.RefChannel(code="office", name="Офис"),
-                models.RefChannel(code="online", name="Интернет-банк"),
-                models.RefChannel(code="call", name="Контакт-центр"),
-                models.RefChannel(code="partner", name="Партнер"),
-            ]
+def _ensure_statuses(db: Session) -> None:
+    # entity_type: application / batch / card
+    rows = [
+        ("application", "NEW", "Новая", 10),
+        ("application", "IN_REVIEW", "На проверке", 20),
+        ("application", "APPROVED", "Одобрена", 30),
+        ("application", "REJECTED", "Отказ", 40),
+        ("application", "IN_BATCH", "В партии", 50),
+        ("batch", "CREATED", "Создана", 10),
+        ("batch", "SENT", "Отправлена", 20),
+        ("batch", "RECEIVED", "Получена", 30),
+        ("card", "CREATED", "Карта создана", 10),
+        ("card", "ISSUED", "Выпущена", 20),
+        ("card", "DELIVERED", "Доставлена", 30),
+        ("card", "HANDED", "Выдана клиенту", 40),
+        ("card", "ACTIVATED", "Активирована", 50),
+        ("card", "CLOSED", "Закрыта", 60),
+    ]
+    for entity_type, code, name, sort_order in rows:
+        ex = (
+            db.query(models.RefStatus)
+            .filter(models.RefStatus.entity_type == entity_type, models.RefStatus.code == code)
+            .first()
         )
-        db.commit()
-
-    # Branches (ensure 6-10)
-    if not _exists(db, models.RefBranch):
-        db.add_all(
-            [
-                models.RefBranch(code="MSK-C", name="Центральный офис", city="Москва", address="ул. Тверская, 1", phone="+7 495 000-00-00"),
-                models.RefBranch(code="MSK-S", name="Южный офис", city="Москва", address="Варшавское ш., 10", phone="+7 495 111-11-11"),
-                models.RefBranch(code="SPB-1", name="Офис Невский", city="Санкт-Петербург", address="Невский пр., 15", phone="+7 812 000-00-00"),
-            ]
-        )
-        db.commit()
-
-    if _count(db, models.RefBranch) < MIN_BRANCHES:
-        existing = {b.code for b in db.execute(select(models.RefBranch)).scalars().all()}
-        candidates = [
-            ("EKB-1", "Екатеринбург • Центр", "Екатеринбург", "пр. Ленина, 25", "+7 343 000-00-00"),
-            ("NSK-1", "Новосибирск • Площадь", "Новосибирск", "Красный пр., 10", "+7 383 000-00-00"),
-            ("KZN-1", "Казань • Кремль", "Казань", "ул. Баумана, 5", "+7 843 000-00-00"),
-            ("KRD-1", "Краснодар • Центр", "Краснодар", "ул. Красная, 40", "+7 861 000-00-00"),
-            ("NN-1", "Нижний Новгород • Центр", "Нижний Новгород", "ул. Большая Покровская, 12", "+7 831 000-00-00"),
-            ("RST-1", "Ростов-на-Дону • Центр", "Ростов-на-Дону", "ул. Большая Садовая, 20", "+7 863 000-00-00"),
-            ("SAM-1", "Самара • Центр", "Самара", "ул. Ленинградская, 9", "+7 846 000-00-00"),
-        ]
-        add = []
-        for code, name, city, address, phone in candidates:
-            if code in existing:
-                continue
-            add.append(models.RefBranch(code=code, name=name, city=city, address=address, phone=phone))
-            if _count(db, models.RefBranch) + len(add) >= MIN_BRANCHES:
-                break
-        if add:
-            db.add_all(add)
-            db.commit()
-
-    # Delivery methods
-    if not _exists(db, models.RefDeliveryMethod):
-        db.add_all(
-            [
-                models.RefDeliveryMethod(code="office", name="Получение в офисе", base_cost=0, sla_days=2),
-                models.RefDeliveryMethod(code="courier", name="Курьер по городу", base_cost=350, sla_days=3),
-                models.RefDeliveryMethod(code="post", name="Почта России", base_cost=250, sla_days=7),
-            ]
-        )
-        db.commit()
-
-    # Vendors (подрядчики)
-    if not _exists(db, models.RefVendor):
-        db.add_all(
-            [
-                models.RefVendor(vendor_type="manufacturer", name="АО 'Пластик-Карт'", contacts="support@plastic-cards.demo", sla_days=3),
-                models.RefVendor(vendor_type="manufacturer", name="ООО 'Гознак Сервис'", contacts="support@goznak.demo", sla_days=4),
-                models.RefVendor(vendor_type="manufacturer", name="АО 'CardTech'", contacts="support@cardtech.demo", sla_days=5),
-                models.RefVendor(vendor_type="courier", name="ООО 'СДЭК'", contacts="support@cdek.demo", sla_days=2),
-                models.RefVendor(vendor_type="courier", name="АО 'Почта России'", contacts="support@post.demo", sla_days=7),
-            ]
-        )
-        db.commit()
-
-    # Reject reasons
-    if not _exists(db, models.RefRejectReason):
-        db.add_all(
-            [
-                models.RefRejectReason(code="kyc", name="KYC/скоринг — отказ"),
-                models.RefRejectReason(code="docs", name="Недостаточно документов"),
-                models.RefRejectReason(code="limits", name="Не подтверждены доходы/лимиты"),
-                models.RefRejectReason(code="dup", name="Дубликат заявки"),
-                models.RefRejectReason(code="client", name="Отказ клиента"),
-            ]
-        )
-        db.commit()
-
-    # Products
-    if not _exists(db, models.RefCardProduct):
-        db.add_all(
-            [
-                models.RefCardProduct(code="MIR-CL", name="МИР Classic", payment_system="МИР", level="Classic", currency="RUB", term_months=36),
-                models.RefCardProduct(code="MIR-GD", name="МИР Gold", payment_system="МИР", level="Gold", currency="RUB", term_months=36),
-                models.RefCardProduct(code="MIR-VIRT", name="МИР Virtual", payment_system="МИР", level="Virtual", currency="RUB", term_months=24, is_virtual=True),
-                models.RefCardProduct(code="VISA-PL", name="VISA Platinum", payment_system="VISA", level="Platinum", currency="RUB", term_months=36),
-                models.RefCardProduct(code="MC-WE", name="Mastercard World Elite", payment_system="MC", level="World Elite", currency="RUB", term_months=36),
-            ]
-        )
-        db.commit()
-
-    # Tariffs
-    if not _exists(db, models.RefTariffPlan):
-        db.add_all(
-            [
-                models.RefTariffPlan(code="BASE", name="Базовый", issue_fee=0, monthly_fee=0, free_condition_text="Без обслуживания при использовании"),
-                models.RefTariffPlan(code="PLUS", name="Плюс", issue_fee=0, monthly_fee=199, free_condition_text="Бесплатно при покупках от 10 000 ₽/мес"),
-                models.RefTariffPlan(code="PREM", name="Премиум", issue_fee=0, monthly_fee=999, free_condition_text="Бесплатно при остатке от 200 000 ₽"),
-            ]
-        )
-        db.commit()
-
-
-def _ensure_clients(db: Session):
-    cur = _count(db, models.Client)
-    if cur >= MIN_CLIENTS:
-        return
-
-    random.seed(42)
-
-    first = ["Иван", "Петр", "Егор", "Андрей", "Сергей", "Никита", "Дмитрий", "Алексей", "Максим", "Арсений", "Владимир", "Константин", "Михаил"]
-    last = ["Иванов", "Петров", "Сидоров", "Кузнецов", "Смирнов", "Попов", "Васильев", "Зайцев", "Ковалев", "Морозов", "Новиков", "Федоров", "Орлов"]
-    middle_m = ["Иванович", "Петрович", "Андреевич", "Сергеевич", "Дмитриевич", "Алексеевич", "Максимович"]
-    middle_f = ["Ивановна", "Петровна", "Андреевна", "Сергеевна", "Дмитриевна", "Алексеевна", "Максимовна"]
-
-    segments = ["mass", "affluent", "premium"]
-    kyc_statuses = ["new", "verified", "failed"]
-    risk = ["low", "medium", "high"]
-    cities = ["Москва", "Санкт-Петербург", "Екатеринбург", "Новосибирск", "Казань", "Краснодар", "Нижний Новгород", "Ростов-на-Дону", "Самара"]
-
-    add = []
-    need = MIN_CLIENTS - cur
-    base_doc = 400000000
-    for i in range(need):
-        is_f = (i % 3 == 0)
-        fn = random.choice(first) + ("а" if is_f and not random.choice(first).endswith("а") else "")
-        ln = random.choice(last) + ("а" if is_f else "")
-        mn = random.choice(middle_f if is_f else middle_m)
-        full = f"{ln} {fn} {mn}"
-
-        phone = f"+7 9{random.randint(10, 99)} {random.randint(100,999)}-{random.randint(10,99)}-{random.randint(10,99)}"
-        email = f"user{i+1}@demo.local"
-
-        bd = date(1978 + random.randint(0, 25), random.randint(1, 12), random.randint(1, 28))
-        doc_num = f"{random.randint(40, 50)} {random.randint(1, 99):02d} {base_doc + i}"
-        city = random.choice(cities)
-        reg = f"{city}, ул. Демонстрационная, д. {random.randint(1, 120)}"
-        fact = f"{city}, пр. Тестовый, д. {random.randint(1, 120)}"
-
-        add.append(
-            models.Client(
-                id=uuid.uuid4(),
-                client_type="person",
-                full_name=full,
-                phone=phone,
-                email=email,
-                birth_date=bd,
-                gender="F" if is_f else "M",
-                citizenship="RU",
-                doc_type="Паспорт",
-                doc_number=doc_num,
-                doc_issue_date=date(bd.year + 20, random.randint(1, 12), random.randint(1, 28)),
-                doc_issuer="ГУ МВД",
-                reg_address=reg,
-                fact_address=fact,
-                segment=random.choice(segments),
-                kyc_status=random.choice(kyc_statuses),
-                risk_level=random.choice(risk),
-                note="seed",
-                created_at=utcnow(),
-                updated_at=utcnow(),
-            )
-        )
-    db.add_all(add)
+        if ex:
+            ex.name = name
+            ex.sort_order = sort_order
+        else:
+            db.add(models.RefStatus(entity_type=entity_type, code=code, name=name, sort_order=sort_order))
     db.commit()
 
 
-def _ensure_applications(db: Session):
-    cur = _count(db, models.CardApplication)
-    if cur >= MIN_APPLICATIONS:
+def _ensure_reject_reasons(db: Session) -> None:
+    if _exists(db, models.RefRejectReason):
+        return
+    db.add_all(
+        [
+            models.RefRejectReason(code="KYC_FAIL", name="Не пройдена проверка (KYC/AML)"),
+            models.RefRejectReason(code="DUPLICATE", name="Дубликат заявки/клиента"),
+            models.RefRejectReason(code="LIMITS", name="Не соответствует требованиям/лимитам"),
+            models.RefRejectReason(code="FRAUD", name="Признаки мошенничества"),
+            models.RefRejectReason(code="OTHER", name="Иная причина"),
+        ]
+    )
+    db.commit()
+
+
+def _ensure_branches(db: Session) -> None:
+    if _exists(db, models.RefBranch):
+        return
+    cities = [
+        ("Москва", "Центральный офис"),
+        ("Санкт-Петербург", "Невский офис"),
+        ("Екатеринбург", "Центр"),
+        ("Новосибирск", "Площадь Ленина"),
+        ("Казань", "Кремлёвская"),
+        ("Нижний Новгород", "Оперный"),
+        ("Пермь", "Комсомольский"),
+        ("Самара", "Набережная"),
+    ]
+    rows = []
+    for i, (city, name) in enumerate(cities[: random.randint(6, 8)], start=1):
+        rows.append(
+            models.RefBranch(
+                code=f"BR{i:02d}",
+                name=name,
+                city=city,
+                address=f"{city}, ул. {random.choice(['Ленина', 'Мира', 'Советская', 'Пушкина', 'Космонавтов'])}, д. {random.randint(1, 200)}",
+                phone=f"+7 495 {random.randint(100, 999)}-{random.randint(10, 99)}-{random.randint(10, 99)}",
+                is_active=True,
+            )
+        )
+    db.add_all(rows)
+    db.commit()
+
+
+def _ensure_channels(db: Session) -> None:
+    if _exists(db, models.RefChannel):
+        return
+    db.add_all(
+        [
+            models.RefChannel(code="BRANCH", name="Отделение", is_active=True),
+            models.RefChannel(code="ONLINE", name="Онлайн", is_active=True),
+            models.RefChannel(code="CALL", name="Колл-центр", is_active=True),
+            models.RefChannel(code="PARTNER", name="Партнёр", is_active=True),
+        ]
+    )
+    db.commit()
+
+
+def _ensure_delivery_methods(db: Session) -> None:
+    if _exists(db, models.RefDeliveryMethod):
+        return
+    db.add_all(
+        [
+            models.RefDeliveryMethod(code="PICKUP", name="Самовывоз", is_active=True),
+            models.RefDeliveryMethod(code="COURIER", name="Курьер", is_active=True),
+            models.RefDeliveryMethod(code="POST", name="Почта России", is_active=True),
+        ]
+    )
+    db.commit()
+
+
+def _ensure_vendors(db: Session) -> None:
+    if _exists(db, models.RefVendor):
+        return
+    db.add_all(
+        [
+            models.RefVendor(vendor_type="manufacturer", name="АО 'Пластик-Карт'", contacts="sales@plastic-card.example", sla_days=3, is_active=True),
+            models.RefVendor(vendor_type="manufacturer", name="ООО 'Гознак Сервис'", contacts="support@goznak-service.example", sla_days=4, is_active=True),
+            models.RefVendor(vendor_type="manufacturer", name="SecureCard Manufacturing", contacts="ops@securecard.example", sla_days=5, is_active=True),
+            models.RefVendor(vendor_type="courier", name="СДЭК", contacts="cdek@logistics.example", sla_days=2, is_active=True),
+            models.RefVendor(vendor_type="courier", name="DPD", contacts="dpd@logistics.example", sla_days=3, is_active=True),
+        ]
+    )
+    db.commit()
+
+
+def _ensure_products(db: Session) -> None:
+    if _exists(db, models.RefCardProduct):
+        return
+    db.add_all(
+        [
+            models.RefCardProduct(code="MIR_CLASSIC", name="МИР Classic", payment_system="МИР", level="Classic", currency="RUB", term_months=36, is_virtual=False, is_active=True),
+            models.RefCardProduct(code="MIR_GOLD", name="МИР Gold", payment_system="МИР", level="Gold", currency="RUB", term_months=36, is_virtual=False, is_active=True),
+            models.RefCardProduct(code="MIR_VIRTUAL", name="МИР Virtual", payment_system="МИР", level="Virtual", currency="RUB", term_months=24, is_virtual=True, is_active=True),
+            models.RefCardProduct(code="MC_WORLDELITE", name="Mastercard World Elite", payment_system="Mastercard", level="World Elite", currency="RUB", term_months=36, is_virtual=False, is_active=True),
+        ]
+    )
+    db.commit()
+
+
+def _ensure_tariffs(db: Session) -> None:
+    if _exists(db, models.RefTariffPlan):
+        return
+    db.add_all(
+        [
+            models.RefTariffPlan(
+                code="BASE",
+                name="Базовый",
+                issue_fee=0,
+                monthly_fee=0,
+                delivery_subsidy=0,
+                free_condition_text="Без обслуживания при использовании",
+                limits_json={"cash_withdrawal_day": 100000, "purchases_month": 500000},
+                is_active=True,
+            ),
+            models.RefTariffPlan(
+                code="PLUS",
+                name="Плюс",
+                issue_fee=0,
+                monthly_fee=199,
+                delivery_subsidy=0,
+                free_condition_text="Бесплатно при покупках от 10 000 ₽/мес",
+                limits_json={"cash_withdrawal_day": 150000, "purchases_month": 800000},
+                is_active=True,
+            ),
+            models.RefTariffPlan(
+                code="PREM",
+                name="Премиум",
+                issue_fee=0,
+                monthly_fee=999,
+                delivery_subsidy=0,
+                free_condition_text="Бесплатно при остатке от 200 000 ₽",
+                limits_json={"cash_withdrawal_day": 300000, "purchases_month": 2000000},
+                is_active=True,
+            ),
+        ]
+    )
+    db.commit()
+
+
+def _rand_phone() -> str:
+    return f"+7 9{random.randint(10,99)} {random.randint(100,999)}-{random.randint(10,99)}-{random.randint(10,99)}"
+
+def _translit_ru(s: str) -> str:
+    out = []
+    for ch in s.lower():
+        if ch in _RU2EN:
+            out.append(_RU2EN[ch])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def _slug_latin(s: str) -> str:
+    s = _translit_ru(s)
+    s = s.replace(" ", ".").replace("'", "").replace("`", "")
+    # keep only ascii letters/digits/dot/underscore/hyphen
+    allowed = set(string.ascii_lowercase + string.digits + "._-")
+    s = "".join(ch for ch in s if ch in allowed)
+    s = re.sub(r"\.+", ".", s).strip(".")
+    return s or f"user{random.randint(1000,9999)}"
+
+def _email_is_ascii(email: str) -> bool:
+    # allow typical email chars
+    return bool(re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", email))
+
+
+
+def _rand_email(full_name: str, used: set[str] | None = None) -> str:
+    slug = _slug_latin(full_name)
+    used = used or set()
+    for _ in range(20):
+        cand = f"{slug}.{random.randint(10,99)}@mail.ru"
+        if cand not in used:
+            used.add(cand)
+            return cand
+    # fallback
+    cand = f"{slug}.{random.randint(100,999)}@mail.ru"
+    used.add(cand)
+    return cand
+
+
+def _passport() -> str:
+    series = random.randint(1000, 9999)
+    number = random.randint(100000, 999999)
+    return f"{series:04d} {number:06d}"
+
+
+def _issuer(city: str) -> str:
+    base = random.choice(["ГУ МВД России", "УМВД России", "ОВД", "УФМС"])
+    tail = random.choice(["по району", "по городу", "по области", "по округу"])
+    return f"{base} {tail} {city}"
+
+
+def _address(city: str) -> str:
+    street = random.choice(["Ленина", "Мира", "Советская", "Пушкина", "Космонавтов", "Гагарина", "Набережная"])
+    prefix = random.choice(["ул.", "пр-т", "пер."])
+    return f"{city}, {prefix} {street}, д. {random.randint(1, 220)}, кв. {random.randint(1, 180)}"
+
+
+def _ensure_clients(db: Session, target: int = 18) -> None:
+    cur = _count(db, models.Client)
+    if cur >= target:
         return
 
-    random.seed(43)
+    last_names_m = ["Иванов", "Петров", "Сидоров", "Морозов", "Кузнецов", "Орлов", "Глазунов", "Смирнов", "Волков", "Егоров"]
+    last_names_f = ["Иванова", "Петрова", "Сидорова", "Морозова", "Кузнецова", "Орлова", "Глазунова", "Смирнова", "Волкова", "Егорова"]
+    first_m = ["Иван", "Пётр", "Максим", "Андрей", "Владимир", "Дмитрий", "Егор", "Константин", "Никита", "Алексей"]
+    first_f = ["Мария", "Анна", "Екатерина", "Ольга", "Наталья", "Татьяна", "Алина", "Ксения", "Юлия", "Ирина"]
+    middle_m = ["Иванович", "Петрович", "Андреевич", "Владимирович", "Дмитриевич", "Сергеевич", "Алексеевич", "Николаевич"]
+    middle_f = ["Ивановна", "Петровна", "Андреевна", "Владимировна", "Дмитриевна", "Сергеевна", "Алексеевна", "Николаевна"]
 
-    clients = db.execute(select(models.Client)).scalars().all()
-    products = db.execute(select(models.RefCardProduct)).scalars().all()
-    tariffs = db.execute(select(models.RefTariffPlan)).scalars().all()
-    channels = db.execute(select(models.RefChannel)).scalars().all()
-    branches = db.execute(select(models.RefBranch)).scalars().all()
-    delivery = db.execute(select(models.RefDeliveryMethod)).scalars().all()
-    reject_reasons = db.execute(select(models.RefRejectReason)).scalars().all()
+    cities = ["Москва", "Санкт-Петербург", "Екатеринбург", "Новосибирск", "Казань", "Нижний Новгород", "Пермь", "Самара"]
 
-    sid_new = _status_id(db, "application", "NEW")
-    sid_rev = _status_id(db, "application", "IN_REVIEW")
-    sid_app = _status_id(db, "application", "APPROVED")
-    sid_rej = _status_id(db, "application", "REJECTED")
-    sid_inb = _status_id(db, "application", "IN_BATCH")
+    segments = ["Mass", "Affluent", "Premium"]
 
-    year = utcnow().year
-    need = MIN_APPLICATIONS - cur
-    add = []
-    now = utcnow()
+    used_emails = set(e for (e,) in db.query(models.Client.email).filter(models.Client.email.isnot(None)).all() if e)
+    kyc = ["new", "verified", "failed"]
+    risks = ["low", "medium", "high"]
 
-    # distribution
-    statuses = (
-        ["NEW"] * 14
-        + ["IN_REVIEW"] * 10
-        + ["APPROVED"] * 18
-        + ["REJECTED"] * 10
-        + ["IN_BATCH"] * 8
-    )
-    random.shuffle(statuses)
+    for _ in range(target - cur):
+        is_f = random.random() < 0.45
+        city = random.choice(cities)
+        if is_f:
+            full = f"{random.choice(last_names_f)} {random.choice(first_f)} {random.choice(middle_f)}"
+            gender = "F"
+        else:
+            full = f"{random.choice(last_names_m)} {random.choice(first_m)} {random.choice(middle_m)}"
+            gender = "M"
 
-    for i in range(need):
-        st = statuses[i % len(statuses)]
-        seq = next_seq(db, "app_seq")
-        no = make_no("APP", year, seq, 6)
+        bd = date(random.randint(1965, 2005), random.randint(1, 12), random.randint(1, 28))
+        doc_num = _passport()
+        issuer = _issuer(city)
+        reg = _address(city)
+        fact = _address(city) if random.random() < 0.6 else reg
 
-        c = random.choice(clients)
-        p = random.choice(products)
-        t = random.choice(tariffs)
+        c = models.Client(
+            id=uuid.uuid4(),
+            client_type="person",
+            full_name=full,
+            phone=_rand_phone(),
+            email=_rand_email(full, used_emails),
+            birth_date=bd,
+            gender=gender,
+            citizenship="RU",
+            doc_type="Паспорт",
+            doc_number=doc_num,
+            doc_issue_date=date(min(bd.year + 20, 2020), random.randint(1, 12), random.randint(1, 28)),
+            doc_issuer=issuer,
+            reg_address=reg,
+            fact_address=fact,
+            segment=random.choice(segments),
+            kyc_status=random.choice(kyc),
+            risk_level=random.choice(risks),
+            note=random.choice([None, "VIP", "salary project", ""]),
+        )
+        db.add(c)
+
+    db.commit()
+
+
+def _backfill_clients_profile(db: Session) -> None:
+    cities = ["Москва", "Санкт-Петербург", "Екатеринбург", "Новосибирск", "Казань", "Нижний Новгород", "Пермь", "Самара"]
+
+    used_emails = set(e for (e,) in db.query(models.Client.email).filter(models.Client.email.isnot(None)).all() if e)
+
+    rows = db.query(models.Client).all()
+    changed = False
+
+    for c in rows:
+        city = random.choice(cities)
+
+        if not c.reg_address or str(c.reg_address).strip() == "":
+            c.reg_address = _address(city)
+            changed = True
+
+        if not c.fact_address or str(c.fact_address).strip() == "":
+            c.fact_address = _address(city)
+            changed = True
+
+        if not c.doc_issuer or str(c.doc_issuer).strip() == "":
+            c.doc_issuer = _issuer(city)
+            changed = True
+
+        # email: make sure it's ascii; if missing or contains non-ascii -> regenerate from name
+        if not c.email or str(c.email).strip() == "":
+            c.email = _rand_email(c.full_name, used_emails)
+            changed = True
+        else:
+            em = str(c.email).strip()
+            if not _email_is_ascii(em):
+                c.email = _rand_email(c.full_name, used_emails)
+                changed = True
+
+    if changed:
+        db.commit()
+
+
+def _ensure_applications(db: Session, target: int = 60) -> None:
+    cur = _count(db, models.CardApplication)
+    if cur >= target:
+        return
+
+    clients = db.query(models.Client).all()
+    products = db.query(models.RefCardProduct).all()
+    tariffs = db.query(models.RefTariffPlan).all()
+    channels = db.query(models.RefChannel).all()
+    branches = db.query(models.RefBranch).all()
+    delivery = db.query(models.RefDeliveryMethod).all()
+    reject_reasons = db.query(models.RefRejectReason).all()
+
+    if not (clients and products and tariffs and channels and branches and delivery):
+        return
+
+    year = datetime.utcnow().year
+    start_seq = cur + 1
+
+    # distribution for statuses
+    statuses = [
+        ("NEW", 0.20),
+        ("IN_REVIEW", 0.15),
+        ("APPROVED", 0.35),
+        ("REJECTED", 0.20),
+        ("IN_BATCH", 0.10),  # will be reconciled later when batches created
+    ]
+
+    def pick_status() -> str:
+        r = random.random()
+        acc = 0.0
+        for code, w in statuses:
+            acc += w
+            if r <= acc:
+                return code
+        return "APPROVED"
+
+    now = datetime.utcnow()
+    for i in range(target - cur):
+        client = random.choice(clients)
+        product = random.choice(products)
+        tariff = random.choice(tariffs)
         ch = random.choice(channels)
         br = random.choice(branches)
         dm = random.choice(delivery)
 
-        req_at = now - timedelta(days=random.randint(0, 40), hours=random.randint(0, 23))
-        planned_issue = (req_at.date() + timedelta(days=random.randint(1, 10))) if st in {"APPROVED", "IN_BATCH"} else None
+        created = now - timedelta(days=random.randint(0, 89), hours=random.randint(0, 23), minutes=random.randint(0, 59))
+        req_deliv = (created.date() + timedelta(days=random.randint(2, 15))) if random.random() < 0.5 else None
 
-        status_id = {"NEW": sid_new, "IN_REVIEW": sid_rev, "APPROVED": sid_app, "REJECTED": sid_rej, "IN_BATCH": sid_inb}[st]
+        status_code = pick_status()
+        status_id = _get_status_id(db, "application", status_code)
 
-        rr_id = None
-        decision_at = None
-        decision_by = None
-        kyc_score = None
-        kyc_result = None
-        if st in {"APPROVED", "REJECTED", "IN_BATCH"}:
-            decision_at = req_at + timedelta(hours=random.randint(3, 72))
-            decision_by = random.choice(["Оператор", "Супервайзер", "Скоринг-сервис"])
-            kyc_score = random.randint(300, 900)
-            kyc_result = "pass" if st != "REJECTED" else random.choice(["fail", "manual"])
-            if st == "REJECTED":
-                rr_id = random.choice(reject_reasons).id
-
-        add.append(
-            models.CardApplication(
-                id=uuid.uuid4(),
-                application_no=no,
-                client_id=c.id,
-                product_id=p.id,
-                tariff_id=t.id,
-                channel_id=ch.id,
-                branch_id=br.id,
-                delivery_method_id=dm.id,
-                delivery_address=c.fact_address if dm.code != "office" else None,
-                embossing_name=(c.full_name.split()[0] + " " + c.full_name.split()[1])[:22],
-                requested_at=req_at,
-                planned_issue_date=planned_issue,
-                status_id=status_id,
-                reject_reason_id=rr_id,
-                kyc_score=kyc_score,
-                kyc_result=kyc_result,
-                kyc_notes="seed",
-                decision_at=decision_at,
-                decision_by=decision_by,
-                priority=random.choice(["low", "normal", "high"]),
-                limits_requested_json={"atm_day": random.choice([100000, 150000, 200000]), "pos_day": random.choice([200000, 300000, 500000])},
-                consent_personal_data=True,
-                consent_marketing=random.choice([False, False, True]),
-                comment="seed",
-                updated_at=req_at,
-            )
+        app = models.CardApplication(
+            id=uuid.uuid4(),
+            application_no=f"APP-{year}-{start_seq + i:06d}",
+            client_id=client.id,
+            product_id=product.id,
+            tariff_id=tariff.id,
+            channel_id=ch.id,
+            branch_id=br.id,
+            delivery_method_id=dm.id,
+            delivery_address=_address(br.city) if dm.code != "PICKUP" else None,
+            delivery_comment=random.choice([None, "Позвонить за 1 час", "Охрана, пропуск на стойке", ""]),
+            embossing_name=" ".join(client.full_name.split()[:2]).upper()[:22],
+            is_salary_project=random.random() < 0.2,
+            requested_at=created,
+            requested_delivery_date=req_deliv,
+            planned_issue_date=(created.date() + timedelta(days=random.randint(3, 12))) if status_code in {"APPROVED", "IN_BATCH"} else None,
+            status_id=status_id,
+            priority=random.choice(["low", "normal", "high"]),
+            limits_requested_json={"atm_day": random.choice([50000, 100000, 150000]), "purchases_month": random.choice([300000, 500000, 800000])},
+            consent_personal_data=True,
+            consent_marketing=random.random() < 0.3,
+            comment=random.choice([None, "Клиент просит доставку в выходной", "Повышенный приоритет", ""]),
         )
 
-    db.add_all(add)
+        # decision fields
+        if status_code in {"APPROVED", "REJECTED", "IN_BATCH"}:
+            app.decision_at = created + timedelta(hours=random.randint(1, 48))
+            app.decision_by = random.choice(["KYC Bot", "Оператор 1", "Оператор 2"])
+            app.kyc_score = random.randint(30, 95)
+            app.kyc_result = "pass" if status_code != "REJECTED" else "fail"
+            app.kyc_notes = random.choice([None, "ok", "manual review", "matchlist check"])
+        if status_code == "REJECTED":
+            app.reject_reason_id = random.choice(reject_reasons).id if reject_reasons else None
+
+        db.add(app)
+
     db.commit()
 
 
-def _ensure_batches_and_cards(db: Session):
-    random.seed(44)
-
+def _ensure_batches_and_cards(db: Session, batches_target: int = 4) -> None:
     # Ensure batches
-    vendors = db.execute(select(models.RefVendor).where(models.RefVendor.vendor_type == "manufacturer")).scalars().all()
+    batches = db.query(models.IssueBatch).all()
+    vendors = db.query(models.RefVendor).all()
+    year = datetime.utcnow().year
+
     if not vendors:
         return
 
-    sid_b_created = _status_id(db, "batch", "CREATED")
-    sid_b_sent = _status_id(db, "batch", "SENT")
-    sid_b_recv = _status_id(db, "batch", "RECEIVED")
+    if len(batches) < batches_target:
+        start_seq = len(batches) + 1
+        for i in range(batches_target - len(batches)):
+            vendor = random.choice(vendors)
+            status_code = random.choice(["CREATED", "SENT", "RECEIVED"])
+            status_id = _get_status_id(db, "batch", status_code)
+            created = datetime.utcnow() - timedelta(days=random.randint(0, 20))
+            planned = created + timedelta(days=random.randint(1, 5))
+            sent = planned + timedelta(hours=random.randint(2, 20)) if status_code in {"SENT", "RECEIVED"} else None
+            received = sent + timedelta(days=random.randint(1, 4)) if status_code == "RECEIVED" else None
 
-    sid_c_created = _status_id(db, "card", "CREATED")
-    sid_c_issued = _status_id(db, "card", "ISSUED")
-    sid_c_del = _status_id(db, "card", "DELIVERED")
-    sid_c_hand = _status_id(db, "card", "HANDED")
-    sid_c_act = _status_id(db, "card", "ACTIVATED")
-
-    now = utcnow()
-
-    # Create missing batches
-    cur_batches = _count(db, models.IssueBatch)
-    to_make = max(0, MIN_BATCHES - cur_batches)
-    year = now.year
-    new_batches = []
-    for _ in range(to_make):
-        seq = next_seq(db, "batch_seq")
-        batch_no = make_no("BAT", year, seq, 6)
-        vendor = random.choice(vendors)
-        st = random.choice(["CREATED", "SENT", "RECEIVED"])
-        st_id = {"CREATED": sid_b_created, "SENT": sid_b_sent, "RECEIVED": sid_b_recv}[st]
-        planned = now + timedelta(days=random.randint(1, 7))
-        sent_at = planned + timedelta(hours=2) if st in {"SENT", "RECEIVED"} else None
-        recv_at = sent_at + timedelta(days=random.randint(1, 5)) if st == "RECEIVED" else None
-        new_batches.append(
-            models.IssueBatch(
+            b = models.IssueBatch(
                 id=uuid.uuid4(),
-                batch_no=batch_no,
+                batch_no=f"BAT-{year}-{start_seq + i:06d}",
                 vendor_id=vendor.id,
-                status_id=st_id,
+                status_id=status_id,
                 planned_send_at=planned,
-                sent_at=sent_at,
-                received_at=recv_at,
-                created_at=now - timedelta(days=random.randint(1, 20)),
+                sent_at=sent,
+                received_at=received,
             )
-        )
-    if new_batches:
-        db.add_all(new_batches)
+            db.add(b)
         db.commit()
 
-    batches = db.execute(select(models.IssueBatch)).scalars().all()
+    batches = db.query(models.IssueBatch).all()
 
-    # Put some APPROVED apps into batches (set status IN_BATCH)
-    sid_inb = _status_id(db, "application", "IN_BATCH")
-    sid_app = _status_id(db, "application", "APPROVED")
+    # Select approved applications not yet in any batch
+    approved_id = _get_status_id(db, "application", "APPROVED")
+    in_batch_id = _get_status_id(db, "application", "IN_BATCH")
 
-    approved_apps = db.execute(
-        select(models.CardApplication).where(models.CardApplication.status_id.in_([sid_app, sid_inb]))
-    ).scalars().all()
-
-    # ensure at least 20 applications in batches
-    in_batch_app_ids = set(
-        db.execute(select(models.IssueBatchItem.application_id)).scalars().all()
+    approved_apps = (
+        db.query(models.CardApplication)
+        .filter(models.CardApplication.status_id == approved_id)
+        .order_by(models.CardApplication.requested_at.desc())
+        .all()
     )
-    target_in_batch = min(25, len(approved_apps))
-    candidates = [a for a in approved_apps if a.id not in in_batch_app_ids]
-    random.shuffle(candidates)
 
-    items_to_add = []
-    for a in candidates[: max(0, target_in_batch - len(in_batch_app_ids))]:
-        b = random.choice(batches)
-        items_to_add.append(
-            models.IssueBatchItem(
+    # Add some approved apps into batches
+    per_batch = max(2, min(8, len(approved_apps) // max(1, len(batches))))
+    take = min(len(approved_apps), per_batch * len(batches))
+
+    used = 0
+    for b in batches:
+        for a in approved_apps[used : used + per_batch]:
+            # ensure unique application_id in IssueBatchItem
+            if db.query(models.IssueBatchItem).filter(models.IssueBatchItem.application_id == a.id).first():
+                continue
+            it = models.IssueBatchItem(
                 id=uuid.uuid4(),
                 batch_id=b.id,
                 application_id=a.id,
-                produced_at=(b.sent_at or now) + timedelta(days=random.randint(0, 2)),
-                delivered_to_branch_at=(b.received_at or now) + timedelta(days=random.randint(1, 4)) if (b.received_at or b.sent_at) else None,
+                produced_at=(b.sent_at or b.planned_send_at or datetime.utcnow()) + timedelta(hours=random.randint(1, 24)),
+                delivered_to_branch_at=(b.received_at or datetime.utcnow()) + timedelta(hours=random.randint(4, 48))
+                if random.random() < 0.7
+                else None,
             )
-        )
-        a.status_id = sid_inb
-        a.updated_at = now
-    if items_to_add:
-        db.add_all(items_to_add)
-        db.commit()
+            a.status_id = in_batch_id
+            db.add(it)
+        used += per_batch
+        if used >= take:
+            break
+    db.commit()
 
-    # Ensure cards for some applications, with different stages
-    existing_cards = {c.application_id for c in db.execute(select(models.Card)).scalars().all()}
-    apps_for_cards = db.execute(select(models.CardApplication)).scalars().all()
-    random.shuffle(apps_for_cards)
+    # Cards: create for part of applications (some may still be NEW/IN_REVIEW/REJECTED without cards)
+    card_count = _count(db, models.Card)
+    start_seq = card_count + 1
 
-    make_count = min(30, len(apps_for_cards))
-    to_create = [a for a in apps_for_cards[:make_count] if a.id not in existing_cards and db.get(models.RefStatus, a.status_id).code in {"APPROVED", "IN_BATCH"}]
+    apps_for_cards = (
+        db.query(models.CardApplication)
+        .filter(models.CardApplication.status_id.in_([in_batch_id, approved_id]))
+        .order_by(models.CardApplication.requested_at.desc())
+        .limit(30)
+        .all()
+    )
 
-    for a in to_create:
-        seq = next_seq(db, "card_seq")
-        card_no = make_no("CARD", now.year, seq, 6)
-        stage = random.choice(["CREATED", "ISSUED", "DELIVERED", "HANDED", "ACTIVATED"])
-        sid = {"CREATED": sid_c_created, "ISSUED": sid_c_issued, "DELIVERED": sid_c_del, "HANDED": sid_c_hand, "ACTIVATED": sid_c_act}[stage]
+    # status ids for cards
+    c_created = _get_status_id(db, "card", "CREATED")
+    c_issued = _get_status_id(db, "card", "ISSUED")
+    c_deliv = _get_status_id(db, "card", "DELIVERED")
+    c_handed = _get_status_id(db, "card", "HANDED")
+    c_activated = _get_status_id(db, "card", "ACTIVATED")
 
-        issued_at = None
-        delivered_at = None
-        handed_at = None
-        activated_at = None
+    channels = db.query(models.RefChannel).all()
+    act_ch = random.choice(channels).id if channels else None
 
-        if stage in {"ISSUED", "DELIVERED", "HANDED", "ACTIVATED"}:
-            issued_at = now - timedelta(days=random.randint(1, 15))
-        if stage in {"DELIVERED", "HANDED", "ACTIVATED"}:
-            delivered_at = issued_at + timedelta(days=random.randint(1, 4)) if issued_at else None
-        if stage in {"HANDED", "ACTIVATED"}:
-            handed_at = (delivered_at or issued_at or now) + timedelta(days=random.randint(1, 3))
-        if stage in {"ACTIVATED"}:
-            activated_at = handed_at + timedelta(hours=random.randint(1, 48)) if handed_at else None
+    def pan_mask() -> str:
+        return f"{random.choice([4276, 5469, 2200])} **** **** {random.randint(1000,9999)}"
 
+    for i, a in enumerate(apps_for_cards):
+        if db.query(models.Card).filter(models.Card.application_id == a.id).first():
+            continue
+
+        stage = random.choices(
+            population=["CREATED", "ISSUED", "DELIVERED", "HANDED", "ACTIVATED"],
+            weights=[0.15, 0.20, 0.20, 0.20, 0.25],
+            k=1,
+        )[0]
+
+        base = a.requested_at + timedelta(days=random.randint(1, 10))
+        issued_at = base if stage in {"ISSUED", "DELIVERED", "HANDED", "ACTIVATED"} else None
+        delivered_at = (issued_at + timedelta(days=random.randint(1, 4))) if stage in {"DELIVERED", "HANDED", "ACTIVATED"} else None
+        handed_at = (delivered_at + timedelta(days=random.randint(0, 3))) if stage in {"HANDED", "ACTIVATED"} else None
+        activated_at = (handed_at + timedelta(hours=random.randint(1, 72))) if stage == "ACTIVATED" else None
+
+        status_id = {
+            "CREATED": c_created,
+            "ISSUED": c_issued,
+            "DELIVERED": c_deliv,
+            "HANDED": c_handed,
+            "ACTIVATED": c_activated,
+        }[stage]
+
+        expiry = datetime.utcnow().date().replace(year=datetime.utcnow().year + 3)
         c = models.Card(
             id=uuid.uuid4(),
-            card_no=card_no,
+            card_no=f"CARD-{year}-{start_seq + i:06d}",
             application_id=a.id,
-            status_id=sid,
-            pan_masked=f"4276 **** **** {random.randint(1000, 9999)}",
-            expiry_month=random.randint(1, 12),
-            expiry_year=now.year + 3,
-            issued_at=issued_at if stage != "CREATED" else None,
+            status_id=status_id,
+            pan_masked=pan_mask() if stage != "CREATED" else None,
+            expiry_month=random.randint(1, 12) if stage != "CREATED" else None,
+            expiry_year=expiry.year if stage != "CREATED" else None,
+            issued_at=issued_at,
             delivered_at=delivered_at,
             handed_at=handed_at,
             activated_at=activated_at,
+            activation_channel_id=act_ch if activated_at else None,
+            note=random.choice([None, "Без пин-конверта", "Доставка в офис", ""]),
         )
         db.add(c)
+
     db.commit()
 
 
-def seed():
-    db = SessionLocal()
-    try:
-        _ensure_reference_data(db)
-        _ensure_clients(db)
-        _ensure_applications(db)
-        _ensure_batches_and_cards(db)
-    finally:
-        db.close()
+def seed() -> None:
+    random.seed(42)
+    with SessionLocal() as db:
+        _ensure_statuses(db)
+        _ensure_reject_reasons(db)
+        _ensure_branches(db)
+        _ensure_channels(db)
+        _ensure_delivery_methods(db)
+        _ensure_vendors(db)
+        _ensure_products(db)
+        _ensure_tariffs(db)
 
-if __name__ == '__main__':
+        _ensure_clients(db, target=25)
+        _backfill_clients_profile(db)
+
+        _ensure_applications(db, target=80)
+        _ensure_batches_and_cards(db, batches_target=7)
+
+
+if __name__ == "__main__":
     seed()

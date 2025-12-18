@@ -2,7 +2,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 from sqlalchemy.orm import Session
-from sqlalchemy import select, text, bindparam
+from sqlalchemy import select, text, bindparam, or_
 from . import models
 from .utils import utcnow, next_seq, make_no
 
@@ -66,7 +66,7 @@ def list_clients(db: Session, q: str | None, limit: int, offset: int):
     stmt = select(models.Client)
     if q:
         like = f"%{q.strip()}%"
-        stmt = stmt.where(models.Client.full_name.ilike(like))
+        stmt = stmt.where(or_(models.Client.full_name.ilike(like), models.Client.doc_number.ilike(like)))
     total = db.execute(select(text("count(*)")).select_from(stmt.subquery())).scalar_one()
     items = db.execute(stmt.order_by(models.Client.created_at.desc()).limit(limit).offset(offset)).scalars().all()
     return total, items

@@ -1,7 +1,8 @@
 from __future__ import annotations
 from datetime import datetime, date
 from uuid import UUID
-from pydantic import BaseModel, Field, ConfigDict
+import re
+from pydantic import BaseModel, Field, ConfigDict, field_validator, ValidationInfo
 
 # ---------- Common ----------
 
@@ -100,6 +101,23 @@ class ClientCreate(BaseModel):
     kyc_status: str = "new"
     risk_level: str | None = None
     note: str | None = None
+
+    @field_validator("doc_number")
+    @classmethod
+    def normalize_doc_number(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if v == "":
+            return None
+        # Normalize passport to: '#### ######' (4 digits series + 6 digits number)
+        doc_type = (info.data.get("doc_type") or "").lower()
+        if "паспорт" in doc_type or doc_type == "":
+            digits = re.sub(r"\D", "", v)
+            if len(digits) != 10:
+                raise ValueError("Паспорт должен содержать 10 цифр: 4 (серия) + 6 (номер), формат '1234 567890'")
+            return f"{digits[:4]} {digits[4:]}"
+        return v
 
 class ClientUpdate(ClientCreate):
     pass

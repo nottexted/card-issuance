@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from uuid import UUID
 
 from fastapi import FastAPI, Depends, Query
@@ -293,23 +293,61 @@ def applications_ensure_card(app_id: UUID, db: Session = Depends(get_db)):
     return schemas.CardEnsureOut(card_id=c.id, card_no=c.card_no)
 
 # Print forms
+def _parse_iso_date(v: str | None) -> date | None:
+    if not v:
+        return None
+    try:
+        return date.fromisoformat(v)
+    except Exception:
+        return None
+
+
+def _normalize_client_for_print(client: dict) -> dict:
+    # In SQL we use row_to_json(c.*): dates come as ISO strings -> convert for templates.
+    out = dict(client or {})
+    for k in ("birth_date", "doc_issue_date"):
+        if isinstance(out.get(k), str):
+            out[k] = _parse_iso_date(out.get(k))  # type: ignore[arg-type]
+    return out
+
 @app.get("/api/applications/{app_id}/print/statement")
-def print_statement(app_id: UUID, db: Session = Depends(get_db)):
+def print_statement(
+    app_id: UUID,
+    staff_name: str | None = None,
+    staff_position: str | None = None,
+    db: Session = Depends(get_db),
+):
     row = service.get_application_bundle(db, app_id)
     if not row: raise ValueError("Application not found")
+    staff_name = staff_name.strip()[:120] if staff_name else None
+    staff_position = staff_position.strip()[:120] if staff_position else None
+    client = _normalize_client_for_print(row["client"])
     pdf_bytes = pdf_renderer.render_pdf("application_statement.html", {
-        "app": row, "client": row["client"], "product": row["product"], "tariff": row["tariff"],
-        "channel": row["channel"], "branch": row["branch"], "delivery": row["delivery"]
+        "app": row, "client": client, "product": row["product"], "tariff": row["tariff"],
+        "channel": row["channel"], "branch": row["branch"], "delivery": row["delivery"],
+        "staff_name": staff_name, "staff_position": staff_position,
+        "generated_at": datetime.utcnow(),
     })
     return StreamingResponse(iter([pdf_bytes]), media_type="application/pdf",
                              headers={"Content-Disposition": f'inline; filename="{row["application_no"]}_statement.pdf"'})
 
 @app.get("/api/applications/{app_id}/print/contract")
-def print_contract(app_id: UUID, db: Session = Depends(get_db)):
+def print_contract(
+    app_id: UUID,
+    staff_name: str | None = None,
+    staff_position: str | None = None,
+    db: Session = Depends(get_db),
+):
     row = service.get_application_bundle(db, app_id)
     if not row: raise ValueError("Application not found")
+    staff_name = staff_name.strip()[:120] if staff_name else None
+    staff_position = staff_position.strip()[:120] if staff_position else None
+    client = _normalize_client_for_print(row["client"])
     pdf_bytes = pdf_renderer.render_pdf("contract_offer.html", {
-        "app": row, "client": row["client"], "product": row["product"], "tariff": row["tariff"]
+        "app": row, "client": client, "product": row["product"], "tariff": row["tariff"],
+        "channel": row["channel"], "branch": row["branch"], "delivery": row["delivery"],
+        "staff_name": staff_name, "staff_position": staff_position,
+        "generated_at": datetime.utcnow(),
     })
     return StreamingResponse(iter([pdf_bytes]), media_type="application/pdf",
                              headers={"Content-Disposition": f'inline; filename="{row["application_no"]}_contract.pdf"'})
